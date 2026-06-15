@@ -125,13 +125,60 @@ def make_batch(
     return x, y
 
 
-def sft_loss(logits, labels, ignore_index=-666, first_token_weight=1.0):
+def make_mixed_batch(
+    sharegpt_examples,
+    short_examples,
+    short_ratio,
+    batch_size,
+    context_length,
+    device,
+    tokenizer,
+    ignore_index=-666,
+):
+    short_count = min(batch_size - 1, max(1, round(batch_size * short_ratio)))
+    sources = [1] * short_count + [0] * (batch_size - short_count)
+    random.shuffle(sources)
+
+    x = torch.full(
+        (batch_size, context_length),
+        tokenizer.vocab_inv["<|pad|>".encode("utf-8")],
+        dtype=torch.long,
+        device=device,
+    )
+    y = torch.full(
+        (batch_size, context_length),
+        ignore_index,
+        dtype=torch.long,
+        device=device,
+    )
+    source_ids = torch.tensor(sources, dtype=torch.long, device=device)
+
+    for b, source in enumerate(sources):
+        pool = short_examples if source else sharegpt_examples
+        for _ in range(10000):
+            prompt_tokens, full_tokens = encode_chat_example(random.choice(pool), tokenizer)
+            if len(full_tokens) <= context_length:
+                break
+        else:
+            raise RuntimeError(f"failed to sample within context_length={context_length}")
+
+        labels = [ignore_index] * len(full_tokens)
+        labels[len(prompt_tokens):] = full_tokens[len(prompt_tokens):]
+        x[b, : len(full_tokens)] = torch.tensor(full_tokens, dtype=torch.long, device=device)
+        y[b, : len(labels)] = torch.tensor(labels, dtype=torch.long, device=device)
+
+    return x, y, source_ids
+
+
+def sft_loss_per_example(
+    logits,
+    labels,
+    ignore_index=-666,
+    first_token_weight=1.0,
+    eos_token_weight=1.0,
+):
     if first_token_weight <= 1.0:
-        return modules.run_cross_entropy_for_gem(
-            logits,
-            labels,
-            ignore_index=ignore_index,
-        )
+        first_token_weight = 1.0
 
     batch_size, _, vocab_size = logits.shape
     logits = logits[:, :-1, :].contiguous()
@@ -148,7 +195,50 @@ def sft_loss(logits, labels, ignore_index=-666, first_token_weight=1.0):
         positions = torch.nonzero(mask[b], as_tuple=False)
         if positions.numel() > 0:
             weights[b, positions[0].item()] = first_token_weight
-    return (losses * weights).sum() / weights.sum().clamp_min(1.0)
+            weights[b, positions[-1].item()] = eos_token_weight
+    return (losses * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+
+def sft_loss(
+    logits,
+    labels,
+    ignore_index=-666,
+    first_token_weight=1.0,
+    eos_token_weight=1.0,
+):
+    return sft_loss_per_example(
+        logits,
+        labels,
+        ignore_index=ignore_index,
+        first_token_weight=first_token_weight,
+        eos_token_weight=eos_token_weight,
+    ).mean()
+
+
+def weighted_mixed_loss(
+    logits,
+    labels,
+    source_ids,
+    short_loss_weight,
+    ignore_index=-666,
+    first_token_weight=1.0,
+    eos_token_weight=1.0,
+):
+    per_example = sft_loss_per_example(
+        logits,
+        labels,
+        ignore_index=ignore_index,
+        first_token_weight=first_token_weight,
+        eos_token_weight=eos_token_weight,
+    )
+    short_mask = source_ids == 1
+    sharegpt_mask = source_ids == 0
+    if short_mask.any() and sharegpt_mask.any():
+        return (
+            short_loss_weight * per_example[short_mask].mean()
+            + (1.0 - short_loss_weight) * per_example[sharegpt_mask].mean()
+        )
+    return per_example.mean()
 
 
 def main():
@@ -159,16 +249,18 @@ def main():
     eval_iters = 30
     log_interval = 50
     checkpoint_interval = 500
-    max_learning_rate = 3e-5
+    max_learning_rate = 2e-5
     min_learning_rate = 5e-6
     warmup_iters = 200
-    extra_iters = 10000
-    first_token_weight = 5.0
+    extra_iters = 5000
+    first_token_weight = 3.0
+    eos_token_weight = 8.0
     max_grad_norm = 0.5
-    ckpt_path = "./data/sharegpt_only_hira_continue_final.pt"
-    fallback_resume_iter = 30000
+    ckpt_path = "./data/mix_short_sharegpt_hira_continue_final.pt"
+    fallback_resume_iter = 50000
     short_instruct_path = "./data/short_instruct_deepseek.jsonl"
-    short_ratio = 0.70
+    short_ratio = 0.875
+    short_loss_weight = 0.95
 
     random.seed(1337)
     np.random.seed(1337)
@@ -176,6 +268,12 @@ def main():
     torch.cuda.manual_seed_all(1337)
 
     tokenizer, vocab_size = load_tokenizer()
+    trainable_token_ids = [
+        tokenizer.vocab_inv["<|endoftext|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|user|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|assistant|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|pad|>".encode("utf-8")],
+    ]
     sharegpt_train, sharegpt_val = split_examples(
         load_sharegpt_pairs("./data/train.jsonl"),
         1337,
@@ -210,12 +308,16 @@ def main():
 
     def embedding_grad_hook(grad):
         grad = grad.clone()
-        grad[:32000] = 0
+        keep = torch.zeros(grad.shape[0], dtype=torch.bool, device=grad.device)
+        keep[trainable_token_ids] = True
+        grad[~keep] = 0
         return grad
 
     def lm_head_grad_hook(grad):
         grad = grad.clone()
-        grad[:, :32000] = 0
+        keep = torch.zeros(grad.shape[1], dtype=torch.bool, device=grad.device)
+        keep[trainable_token_ids] = True
+        grad[:, ~keep] = 0
         return grad
 
     model.token_embeddings.embedding_weights.register_hook(embedding_grad_hook)
@@ -251,7 +353,7 @@ def main():
             "batch_size": batch_size,
             "lr": max_learning_rate,
         },
-        name="[sharegpt-only] HiRA-r16 continue "
+        name="[mix-sharegpt-short] HiRA-r16 continue "
         + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         save_code=False,
     )
@@ -260,7 +362,13 @@ def main():
     print("resume_ckpt_path:", ckpt_path)
     print("resume_iter:", resume_iter, "start_iter:", start_iter, "target_iter:", max_iters)
     print("sharegpt train:", len(sharegpt_train), "val:", len(sharegpt_val))
-    print("short train:", len(short_train), "val:", len(short_val), "ratio:", short_ratio)
+    print(
+        "short train:", len(short_train),
+        "val:", len(short_val),
+        "sample_ratio:", short_ratio,
+        "loss_weight:", short_loss_weight,
+        "eos_weight:", eos_token_weight,
+    )
     print("initial update_ratio:", get_hira_update_ratio(model))
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -297,6 +405,7 @@ def main():
                         y,
                         ignore_index=-666,
                         first_token_weight=first_token_weight,
+                        eos_token_weight=eos_token_weight,
                     )
             out[split] = {
                 "loss": losses.mean().item(),
@@ -320,21 +429,24 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        x, y = make_batch(
-            sharegpt_train,
-            batch_size,
-            context_length,
-            device,
-            tokenizer,
+        x, y, source_ids = make_mixed_batch(
+            sharegpt_examples=sharegpt_train,
             short_examples=short_train,
             short_ratio=short_ratio,
+            batch_size=batch_size,
+            context_length=context_length,
+            device=device,
+            tokenizer=tokenizer,
         )
         with autocast:
-            loss = sft_loss(
+            loss = weighted_mixed_loss(
                 model(x),
                 y,
+                source_ids,
+                short_loss_weight,
                 ignore_index=-666,
                 first_token_weight=first_token_weight,
+                eos_token_weight=eos_token_weight,
             )
 
         optimizer.zero_grad(set_to_none=True)
@@ -368,7 +480,7 @@ def main():
 
         if it % checkpoint_interval == 0:
             os.makedirs("checkpoints", exist_ok=True)
-            ckpt_save_path = f"checkpoints/sharegpt_only_hira_continue_iter_{it}.pt"
+            ckpt_save_path = f"checkpoints/mix_short_sharegpt_hira_continue_iter_{it}.pt"
             if previous_ckpt_path:
                 os.remove(previous_ckpt_path)
             modules.run_save_checkpoint(model, optimizer, it, ckpt_save_path)
@@ -377,9 +489,9 @@ def main():
 
     torch.save(
         {"model": model.state_dict(), "it": max_iters},
-        "./data/sharegpt_only_hira_continue_final.pt",
+        "./data/mix_short_sharegpt_hira_continue_final.pt",
     )
-    print("saved final weights to ./data/sharegpt_only_hira_continue_final.pt")
+    print("saved final weights to ./data/mix_short_sharegpt_hira_continue_final.pt")
     wandb.finish()
 
 
