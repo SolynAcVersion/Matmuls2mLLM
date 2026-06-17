@@ -252,15 +252,15 @@ def main():
     max_learning_rate = 2e-5
     min_learning_rate = 5e-6
     warmup_iters = 200
-    extra_iters = 5000
-    first_token_weight = 3.0
-    eos_token_weight = 8.0
+    extra_iters = 10000
+    first_token_weight = 1.0
+    eos_token_weight = 1.0
     max_grad_norm = 0.5
     ckpt_path = "./data/mix_short_sharegpt_hira_continue_final.pt"
     fallback_resume_iter = 50000
     short_instruct_path = "./data/short_instruct_deepseek.jsonl"
-    short_ratio = 0.875
-    short_loss_weight = 0.95
+    short_ratio = 0.30
+    short_loss_weight = 0.30
 
     random.seed(1337)
     np.random.seed(1337)
@@ -306,22 +306,7 @@ def main():
     model.token_embeddings.embedding_weights.requires_grad = True
     model.lm_head.W.requires_grad = True
 
-    def embedding_grad_hook(grad):
-        grad = grad.clone()
-        keep = torch.zeros(grad.shape[0], dtype=torch.bool, device=grad.device)
-        keep[trainable_token_ids] = True
-        grad[~keep] = 0
-        return grad
 
-    def lm_head_grad_hook(grad):
-        grad = grad.clone()
-        keep = torch.zeros(grad.shape[1], dtype=torch.bool, device=grad.device)
-        keep[trainable_token_ids] = True
-        grad[:, ~keep] = 0
-        return grad
-
-    model.token_embeddings.embedding_weights.register_hook(embedding_grad_hook)
-    model.lm_head.W.register_hook(lm_head_grad_hook)
     for name, param in model.named_parameters():
         if ".A" in name or ".B" in name:
             param.requires_grad = True
@@ -346,7 +331,7 @@ def main():
     with open("./pswd.json", encoding="utf-8") as file:
         os.environ["WANDB_API_KEY"] = json.load(file)["wandb-api-key"]
     wandb.init(
-        project="gpt2vision_sft_chat_templetes",
+        project="RE_gpt2vision_sft_chat_templetes",
         config={
             "resume_ckpt_path": ckpt_path,
             "target_iter": max_iters,
@@ -463,7 +448,7 @@ def main():
                 f"tok/s {tokens_per_iter * log_interval / dt:.0f} | "
                 f"update_ratio {update_ratio:.6f}"
             )
-            wandb.log({"loss": loss.item()}, step=it)
+            wandb.log({"loss": loss.item(), "iter": it}, step=it)
             t0 = time.time()
 
         if it % eval_interval == 0:
@@ -476,7 +461,7 @@ def main():
                 f"val_w {losses['val']['weighted_loss']:.4f} | "
                 f"short val {losses['short_val']['loss']:.4f}"
             )
-            wandb.log({"val_loss": losses["val"]["loss"]}, step=it)
+            wandb.log({"[eval] iter": it, "val_loss": losses["val"]["loss"]}, step=it)
 
         if it % checkpoint_interval == 0:
             os.makedirs("checkpoints", exist_ok=True)

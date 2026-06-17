@@ -1,6 +1,8 @@
+import contextlib
 import os
 import glob
 import random
+import time
 import numpy as np
 import torch
 import datetime
@@ -168,41 +170,6 @@ def get_batch_from_json(
     return x, y
 
 
-def run_sft_loss(
-    logits,
-    labels,
-    ignore_index=-666,
-    first_token_weight=1.0,
-):
-    if first_token_weight <= 1.0:
-        return modules.run_cross_entropy_for_gem(
-            logits,
-            labels,
-            ignore_index=ignore_index,
-        )
-
-    batch_size, seq_len, vocab_size = logits.shape
-    logits = logits[:, :-1, :].contiguous()
-    labels = labels[:, 1:].contiguous()
-
-    losses = F.cross_entropy(
-        logits.view(-1, vocab_size),
-        labels.view(-1),
-        ignore_index=ignore_index,
-        reduction="none",
-    ).view(batch_size, seq_len - 1)
-
-    mask = labels != ignore_index
-    weights = mask.float()
-
-    for b in range(batch_size):
-        positions = torch.nonzero(mask[b], as_tuple=False)
-        if positions.numel() > 0:
-            weights[b, positions[0].item()] = first_token_weight
-
-    return (losses * weights).sum() / weights.sum().clamp_min(1.0)
-
-
 @torch.no_grad()
 def estimate_first_token_rank(
     model,
@@ -285,344 +252,288 @@ class HiRALinear(nn.Module):
 
 
 def sft():
-    # Evol-SFT & GEM
-    # device = torch.device("cpu")
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    rank = 0
-    world_size = 1
-
-    
     context_length = 1024
     batch_size = 8
-
-    d_model = 1024
-    num_layers = 24
-    num_heads = 16
-    d_ff = 2752
-    rope_theta = 10000
-
-    max_iters = 10100
-    eval_interval = 500
-    eval_iters = 50
+    eval_interval = 250
+    eval_iters = 30
     log_interval = 50
-    checkpoint_interval = 2000
-
-    max_learning_rate = 1e-5
-    min_learning_rate = 2e-6
+    checkpoint_interval = 500
+    max_learning_rate = 2e-5
+    min_learning_rate = 5e-6
     warmup_iters = 200
-    cosine_cycle_iters = max_iters
+    max_iters = 20100
+    start_iter = 1
+    cosine_cycle_iters = max_iters - start_iter + 1
+    max_grad_norm = 0.5
+    data_path = "./data/alpaca_evol_instruct_70k.json"
+    final_path = "./data/evol_sft_hira_from_pretrain_final.pt"
 
-    weight_decay = 0.0
-    betas = (0.9, 0.95)
-    eps = 1e-8
-    max_grad_norm = 0.1
-    max_hira_update_ratio = 0.2
+    random.seed(1337)
+    np.random.seed(1337)
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
 
-    tokens_per_iter = batch_size * context_length * world_size
+    tokenizer, vocab_size = load_tokenizer()
+    trainable_token_ids = [
+        tokenizer.vocab_inv["<|endoftext|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|user|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|assistant|>".encode("utf-8")],
+        tokenizer.vocab_inv["<|pad|>".encode("utf-8")],
+    ]
 
-    tk, vocab_size = load_tokenizer()
-    assistant_token_id = tk.vocab_inv["<|assistant|>".encode("utf-8")]
-    
-    seed = 1337 + rank
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    with open(data_path, encoding="utf-8") as file:
+        examples = [
+            example
+            for example in json.load(file)
+            if str(example.get("instruction", "")).strip()
+            and str(example.get("output", "")).strip()
+        ]
+    if not examples:
+        raise RuntimeError(f"no valid Evol-SFT examples loaded from {data_path}")
+    random.Random(1337).shuffle(examples)
+    valid_end = max(1, len(examples) // 10)
+    train_examples = examples[valid_end:]
+    val_examples = examples[:valid_end]
 
-    if rank == 0:
-        print("单卡模式")
-        print("rank:", rank)
-        print("world_size:", world_size)
-        print("device:", device)
+    def make_batch(examples):
+        if not examples:
+            raise ValueError("cannot sample from an empty dataset")
 
-    obj = torch.load(PRETRAIN_CKPT_PATH, map_location="cpu")
-    state_dict = obj["model"]
-    
-
-    nowtime = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    
-    with open('./pswd.json') as file:
-        pswds = json.load(file)
-    os.environ['WANDB_API_KEY'] = pswds["wandb-api-key"]
-    
-    wandb.init(
-        project='gpt2vision_sft_chat_templetes',
-        config={
-        },
-        name='[RE] HiRA + GEM-r-16 + ' + nowtime,
-        save_code=True
-    )
-
-    model = modules.TransformerLM(
-            vocab_size=vocab_size,
-            context_length=context_length,
-            d_model=d_model,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            d_ff=d_ff,
-            rope_theta=rope_theta,
+        pad_token_id = tokenizer.vocab_inv["<|pad|>".encode("utf-8")]
+        x = torch.full(
+            (batch_size, context_length),
+            pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        y = torch.full(
+            (batch_size, context_length),
+            -666,
+            dtype=torch.long,
+            device=device,
         )
 
-    model.load_state_dict(state_dict)
+        for b in range(batch_size):
+            for _ in range(10000):
+                prompt_tokens, full_tokens = encode_chat_example(
+                    random.choice(examples),
+                    tokenizer,
+                )
+                if len(full_tokens) <= context_length:
+                    break
+            else:
+                raise RuntimeError(
+                    f"failed to sample an Evol-SFT example within context_length={context_length}"
+                )
+
+            labels = [-666] * len(full_tokens)
+            labels[len(prompt_tokens):] = full_tokens[len(prompt_tokens):]
+            x[b, : len(full_tokens)] = torch.tensor(
+                full_tokens,
+                dtype=torch.long,
+                device=device,
+            )
+            y[b, : len(labels)] = torch.tensor(
+                labels,
+                dtype=torch.long,
+                device=device,
+            )
+
+        return x, y
+
+    model = modules.TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=1024,
+        num_layers=24,
+        num_heads=16,
+        d_ff=2752,
+        rope_theta=10000,
+    )
 
 
-    for l in model.layers:
-        l.attn.q_proj = HiRALinear(l.attn.q_proj)
-        l.attn.k_proj = HiRALinear(l.attn.k_proj)
-        l.attn.v_proj = HiRALinear(l.attn.v_proj)
-        l.attn.o_proj = HiRALinear(l.attn.o_proj)
-        
-        l.ffn.w1 = HiRALinear(l.ffn.w1)
-        l.ffn.w2 = HiRALinear(l.ffn.w2)
-        l.ffn.w3 = HiRALinear(l.ffn.w3)
-
-    
-
+    for layer in model.layers:
+        layer.attn.q_proj = HiRALinear(layer.attn.q_proj)
+        layer.attn.k_proj = HiRALinear(layer.attn.k_proj)
+        layer.attn.v_proj = HiRALinear(layer.attn.v_proj)
+        layer.ffn.w2 = HiRALinear(layer.ffn.w2)
+        layer.ffn.w3 = HiRALinear(layer.ffn.w3)
 
     for param in model.parameters():
         param.requires_grad = False
-        
-    base_vocab_size = 32000
     model.token_embeddings.embedding_weights.requires_grad = True
     model.lm_head.W.requires_grad = True
 
     def embedding_grad_hook(grad):
         grad = grad.clone()
-        grad[:base_vocab_size] = 0
+        keep = torch.zeros(grad.shape[0], dtype=torch.bool, device=grad.device)
+        keep[trainable_token_ids] = True
+        grad[~keep] = 0
         return grad
 
     def lm_head_grad_hook(grad):
         grad = grad.clone()
-        grad[:, :base_vocab_size] = 0
+        keep = torch.zeros(grad.shape[1], dtype=torch.bool, device=grad.device)
+        keep[trainable_token_ids] = True
+        grad[:, ~keep] = 0
         return grad
 
     model.token_embeddings.embedding_weights.register_hook(embedding_grad_hook)
     model.lm_head.W.register_hook(lm_head_grad_hook)
-
-    for n, p in model.named_parameters():
-        if ".A" in n or ".B" in n:
-            p.requires_grad = True
+    for name, param in model.named_parameters():
+        if ".A" in name or ".B" in name:
+            param.requires_grad = True
+    resume_obj = torch.load('./checkpoints/evol_sft_hira_from_pretrain_iter_13000.pt', map_location="cpu")
+    model.load_state_dict(resume_obj["model"])
+    resume_iter = resume_obj["it"]
+    start_iter = resume_iter + 1
 
     model.to(device)
-
-    print("===== HiRA replacements all done")
-    print("initial HiRA update_ratio", get_hira_update_ratio(model))
-
-    trainable = 0
-    total = 0
-
-    for n,p in model.named_parameters():
-
-        total += p.numel()
-
-        if p.requires_grad:
-            trainable += p.numel()
-            print(n, p.numel())
-
-    print(
-        f"trainable={trainable:,}"
-    )
-
-    print(
-        f"total={total:,}"
-    )
-
-    print(
-        f"ratio={100*trainable/total:.4f}%"
-    )
-
     model.train()
 
     optimizer = modules.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=max_learning_rate,
-        weight_decay=weight_decay,
-        betas=betas,
-        eps=eps,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+        eps=1e-8,
     )
 
+    optimizer.load_state_dict(resume_obj["optim"])
 
+    with open("./pswd.json", encoding="utf-8") as file:
+        os.environ["WANDB_API_KEY"] = json.load(file)["wandb-api-key"]
+    wandb.init(
+        project="RE_gpt2vision_sft_chat_templetes",
+        config={
+            "pretrain_ckpt_path": PRETRAIN_CKPT_PATH,
+            "target_iter": max_iters,
+            "batch_size": batch_size,
+            "lr": max_learning_rate,
+        },
+        name="[evol-gem] HiRA-r16 from pretrain "
+        + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        save_code=False,
+    )
 
+    print("device:", device)
+    print("pretrain_ckpt_path:", PRETRAIN_CKPT_PATH)
+    print("start_iter:", start_iter, "target_iter:", max_iters)
+    print("evol train:", len(train_examples), "val:", len(val_examples))
+    print("trainable_token_ids:", trainable_token_ids)
+    print("initial update_ratio:", get_hira_update_ratio(model))
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"trainable={trainable:,} total={total:,} ratio={100 * trainable / total:.4f}%")
+
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    )
 
     @torch.no_grad()
     def estimate_loss():
         model.eval()
         out = {}
-
-        for split in ["train", "val"]:
+        for split, split_examples in (("train", train_examples), ("val", val_examples)):
             losses = torch.zeros(eval_iters, device=device)
-
             for k in range(eval_iters):
-                x, y = get_batch_from_json(
-                    json_data=json_data,
-                    batch_size=batch_size,
-                    context_length=context_length,
-                    device=device,
-                    tokenizer=tk,
-                    for_valid=(split == "val"),
-                    ignore_index=-666
-                )
-
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.bfloat16,
-                ):
-                    logits = model(x)
-                    loss = modules.run_cross_entropy_for_gem(logits, y, ignore_index=-666)
-
-                losses[k] = loss
-
-            mean_loss = losses.mean()
-            out[split] = mean_loss.item()
-
+                x, y = make_batch(split_examples)
+                with autocast:
+                    losses[k] = modules.run_cross_entropy_for_gem(
+                        model(x),
+                        y,
+                        ignore_index=-666,
+                    )
+            out[split] = losses.mean().item()
         model.train()
         return out
 
-    json_data = []
+    previous_ckpt_path = ""
+    tokens_per_iter = batch_size * context_length
+    t0 = time.time()
 
-    with open('./data/alpaca_evol_instruct_70k.json') as file:
-        json_data = json.load(file) 
-
-
-    # prev_ckpt_path = './checkpoints/sft_EvolSft_r_512_gpt2med_iter_30000.pt'
-
-    # last_iter = modules.run_load_checkpoint(prev_ckpt_path, model, optimizer)
-
-    import time
-
-    t0 = time.time()   
-     
-    prev_ckpt_path = ''
-
-    for it in range(int(max_iters)):
+    for it in range(start_iter, max_iters + 1):
         lr = modules.run_get_lr_cosine_schedule(
-            it=it,
+            it=it - start_iter + 1,
             max_learning_rate=max_learning_rate,
             min_learning_rate=min_learning_rate,
             warmup_iters=warmup_iters,
             cosine_cycle_iters=cosine_cycle_iters,
         )
-
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        x, y = get_batch_from_json(
-            json_data=json_data,
-            batch_size=batch_size,
-            context_length=context_length,
-            device=device,
-            tokenizer=tk
-        )
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-        ):
-            logits = model(x)
-
-            loss = modules.run_cross_entropy_for_gem(logits, y, ignore_index=-666)
-
-            
+        x, y = make_batch(train_examples)
+        with autocast:
+            loss = modules.run_cross_entropy_for_gem(
+                model(x),
+                y,
+                ignore_index=-666,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-
-        modules.run_gradient_clipping(
-            model.parameters(),
-            max_l2_norm=max_grad_norm,
-        )
-
+        modules.run_gradient_clipping(model.parameters(), max_l2_norm=max_grad_norm)
         optimizer.step()
 
-        hira_update_ratio = get_hira_update_ratio(model)
-        # if hira_update_ratio > max_hira_update_ratio:
-        #     raise RuntimeError(
-        #         f"HiRA update_ratio too high: {hira_update_ratio:.6f} "
-        #         f"> {max_hira_update_ratio}. Stop training and lower lr/alpha."
-        #     )
-
-
-        if rank == 0 and it % log_interval == 0:
+        if it % log_interval == 0:
             dt = time.time() - t0
-
-            tokens_in_window = tokens_per_iter * log_interval
-
-            tok_s = tokens_in_window / dt
-
-            tokens_processed = it * tokens_per_iter
-
-            print(
-                f"iter {it} "
-                f"loss {loss.item():.4f} "
-                f"lr {lr:.6e} | "
-                f"tok/s {tok_s:.0f} | "
-                f"tokens {tokens_processed / 1e9:.3f}B | "
-                f"update_ratio {hira_update_ratio}"
-            )
-
-            wandb.log({
-                "iter": it,
-                "lr": lr,
-                "loss": loss.item(),
-                "tok/s": tok_s,
-                "tokens_B": tokens_processed / 1e9
-            })
-
-
             a_norm, b_norm = get_hira_ab_norm(model)
-
-            wandb.log({
-                "adapter/A_norm": a_norm,
-                "adapter/B_norm": b_norm,
-            })
-
-            wandb.log({"adapter/update_ratio": hira_update_ratio})
-
-
-
+            update_ratio = get_hira_update_ratio(model)
+            print(
+                f"iter {it} loss {loss.item():.4f} lr {lr:.6e} | "
+                f"tok/s {tokens_per_iter * log_interval / dt:.0f} | "
+                f"update_ratio {update_ratio:.6f}"
+            )
+            wandb.log(
+                {
+                    "loss": loss.item(),
+                    "adapter/A_norm": a_norm,
+                    "adapter/B_norm": b_norm,
+                    "adapter/update_ratio": update_ratio,
+                },
+                step=it,
+            )
             t0 = time.time()
 
         if it % eval_interval == 0:
             losses = estimate_loss()
-            if rank == 0:
-                print(
-                    f"[eval] iter {it:8d} | "
-                    f"train {losses['train']:.4f} | "
-                    f"val {losses['val']:.4f}"
-                )
-                wandb.log({
-                    "[eval] iter": it,
-                    "[eval] train_loss": losses['train'],
-                    "[eval] val_loss": losses['val']
-                })
-                print(
-                    model.token_embeddings.embedding_weights[
-                        assistant_token_id
-                    ].norm()
-                )
-
-        if rank == 0 and it > 0 and it % checkpoint_interval == 0:
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = f"checkpoints/RE_sft_EvolSft_HiRA_r_16_gpt2med_iter_{it}.pt"
-
-            if prev_ckpt_path != '':
-                os.remove(prev_ckpt_path)
-
-            prev_ckpt_path = ckpt_path
-
-            modules.run_save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                iteration=it,
-                out=ckpt_path,
+            print(
+                f"[eval] iter {it:8d} | "
+                f"evol train {losses['train']:.4f} | "
+                f"evol val {losses['val']:.4f}"
             )
-            print(f"saved checkpoint to {ckpt_path}")
+            wandb.log({"val_loss": losses["val"]}, step=it)
+            inp = "<|user|>\nWhat is the capital of China?\n<|assistant|>\n"
+            inp = tokenizer.encode(inp)
+            out = modules.generating(
+                model=model,
+                enc_user_prompt=inp,
+                end_token=31999,
+                context_len=1024,
+                max_token=32,
+                temperature=0.2,
+            )
+            print(tokenizer.decode(out))
 
-    obj = {}
-    obj["model"] = model.state_dict()
-    torch.save(obj, './data/weights-sft-1-EvolSft-HiRA-r-16-text.pt')
 
+        if it % checkpoint_interval == 0:
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_save_path = f"checkpoints/evol_sft_hira_from_pretrain_iter_{it}.pt"
+            if previous_ckpt_path:
+                os.remove(previous_ckpt_path)
+            modules.run_save_checkpoint(model, optimizer, it, ckpt_save_path)
+            previous_ckpt_path = ckpt_save_path
+            print(f"saved checkpoint to {ckpt_save_path}")
+
+    torch.save(
+        {"model": model.state_dict(), "it": max_iters},
+        final_path,
+    )
+    print(f"saved final weights to {final_path}")
     wandb.finish()
 
 
@@ -742,7 +653,7 @@ def sft_LoRA():
     os.environ['WANDB_API_KEY'] = pswds["wandb-api-key"]
     
     wandb.init(
-        project='gpt2vision_sft_chat_templetes',
+        project='RE_gpt2vision_sft_chat_templetes',
         config={
         },
         name='LoRA Bench-r-512 ' + nowtime,

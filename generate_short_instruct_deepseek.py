@@ -24,39 +24,56 @@ def load_api_key(path):
 def build_prompt(n, batch_id):
     return f"""Generate {n} single-turn instruction tuning examples for a small chat assistant.
 
-Output JSONL only. Each line must be one valid JSON object with exactly these keys: "instruction" and "output".
-Do not use markdown fences. Do not put two JSON objects on one line. Do not include any explanation.
+Output **only raw JSONL**. Each line must be one valid JSON object with exactly these keys: "instruction" and "output".
+Do not use markdown fences, code blocks, or any other formatting. Do not include any explanation.
 
-Requirements:
-- Responses must be short, direct, and natural.
-- 60% of outputs should be 1 sentence.
-- 30% of outputs should be 2-3 sentences.
+The assistant's name is **Shengoovlei**. It must know this name and use it appropriately when asked.
+
+**Critical Rule: All responses MUST be extremely short, direct, and concise.**
+- 70% of outputs must be 1 sentence or a short phrase (under 10 words).
+- 20% of outputs may be 2-3 short sentences.
 - 10% may be one-word or yes/no answers.
-- Avoid long essays, roleplay, story continuation, code debugging, chapter outlines, and repeated examples.
-- Avoid labels like "repeat" or "example".
 
-Include a balanced mix:
-- greetings and small talk
-- yes/no questions
-- one-word answers
-- simple factual QA
-- practical preparation advice
-- answer-format following
-- simple math
-- classification
-- brief rewrite
-- one-sentence summary
-- uncertainty for unknown/live data
-- polite refusal for impossible requests
+**The dataset must focus on THREE specific areas:**
+1. **Greetings and social talk** (30% of examples)
+   - How are you? → I'm fine, thanks.
+   - Hello → Hello! How can I help?
+   - What's your name? → My name is Shengoovlei.
+   - Nice to meet you → Nice to meet you too.
 
-Style examples:
-{{"instruction":"Is fire cold?","output":"No. Fire is hot."}}
-{{"instruction":"Hello, how are you today?","output":"I'm doing well. How can I help you today?"}}
-{{"instruction":"What should I prepare for a climbing tour?","output":"Bring sturdy shoes, water, snacks, layered clothing, sun protection, a first-aid kit, and a map or GPS."}}
-{{"instruction":"Answer with one word: What color is the sky on a clear day?","output":"Blue"}}
+2. **Simple instruction following (repeat, say, copy)** (30% of examples)
+   - Repeat after me: Blue → Blue
+   - Say the word: apple → apple
+   - Copy this: 123 → 123
+   - Just repeat: Hello → Hello
 
-Diversity seed: batch-{batch_id}
-"""
+3. **Simple arithmetic and basic logic** (20% of examples)
+   - What is 2+2? → 4
+   - 3+5=? → 8
+   - What is 10-3? → 7
+   - Double 4 → 8
+
+4. **General knowledge + one-word/short answer** (20% of examples)
+   - What color is the sky? → Blue.
+   - Is water wet? → Yes.
+   - Is fire cold? → No. Fire is hot.
+
+**Strictly Prohibited:**
+- DO NOT start any output with "I don't have access", "I can't", "I'm sorry", "As an AI", "I am not sure", or similar refusals.
+- DO NOT use phrases like "Here are some steps", "The following are", or "Certainly, here is".
+- DO NOT generate long essays, lists, or explanations.
+
+**Style examples (these are perfect):**
+{{"instruction":"Hello, how are you?","output":"I'm fine, thanks."}}
+{{"instruction":"Repeat after me: Blue","output":"Blue"}}
+{{"instruction":"What is 2+2?","output":"4"}}
+{{"instruction":"What is your name?","output":"My name is Shengoovlei."}}
+{{"instruction":"Say the word: apple","output":"apple"}}
+{{"instruction":"What color is the sky?","output":"Blue."}}
+{{"instruction":"3+5=?","output":"8"}}
+{{"instruction":"Is water wet?","output":"Yes."}}
+
+Diversity seed: batch-{batch_id}"""
 
 
 def call_deepseek(api_key, prompt, max_tokens):
@@ -131,8 +148,8 @@ def count_valid_rows(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--key-json", default="./pswd.json")
-    parser.add_argument("--out", default="./data/short_instruct_deepseek.jsonl")
-    parser.add_argument("--target-total", type=int, default=30000)
+    parser.add_argument("--out", default="./data/simple_logits_deepseek.jsonl")
+    parser.add_argument("--target-total", type=int, default=20000)
     parser.add_argument("--chunk-size", type=int, default=3000)
     parser.add_argument("--per-batch", type=int, default=100)
     parser.add_argument("--max-tokens", type=int, default=10000)
