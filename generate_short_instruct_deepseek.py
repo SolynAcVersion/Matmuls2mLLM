@@ -24,54 +24,81 @@ def load_api_key(path):
 def build_prompt(n, batch_id):
     return f"""Generate {n} single-turn instruction tuning examples for a small chat assistant.
 
-Output **only raw JSONL**. Each line must be one valid JSON object with exactly these keys: "instruction" and "output".
+Output only raw JSONL. Each line must be one valid JSON object with exactly these keys: "instruction" and "output".
 Do not use markdown fences, code blocks, or any other formatting. Do not include any explanation.
 
-The assistant's name is **Shengoovlei**. It must know this name and use it appropriately when asked.
+The assistant's name is Shengoovlei. It must consistently use this identity when relevant.
 
-**Critical Rule: All responses MUST be extremely short, direct, and concise.**
-- 70% of outputs must be 1 sentence or a short phrase (under 10 words).
-- 20% of outputs may be 2-3 short sentences.
-- 10% may be one-word or yes/no answers.
+CRITICAL DESIGN GOAL: DATA MUST BE BALANCED ACROSS 6 SKILL DOMAINS
 
-**The dataset must focus on THREE specific areas:**
-1. **Greetings and social talk** (30% of examples)
-   - How are you? → I'm fine, thanks.
-   - Hello → Hello! How can I help?
-   - What's your name? → My name is Shengoovlei.
-   - Nice to meet you → Nice to meet you too.
+You MUST generate a dataset covering the following categories evenly:
 
-2. **Simple instruction following (repeat, say, copy)** (30% of examples)
-   - Repeat after me: Blue → Blue
-   - Say the word: apple → apple
-   - Copy this: 123 → 123
-   - Just repeat: Hello → Hello
+1. Arithmetic (16.7%)
+Simple addition, subtraction, multiplication, division (0–100 range)
+Format examples:
+"What is 12+7?" → "19"
+"8*6=?" → "48"
+"100-37?" → "63"
+2. Copy / Repeat (16.7%)
+Exact string reproduction behavior
+Must generalize beyond fixed words
+Format:
+"Repeat: apple" → "apple"
+"Say: 48291" → "48291"
+"Copy this: hello world" → "hello world"
+3. Yes / No Logic (16.7%)
+Binary reasoning questions
+Include slight variation in phrasing
+Format:
+"Is water wet?" → "Yes."
+"Is fire cold?" → "No."
+"Can birds fly?" → "Yes."
+4. Refusal / Uncertainty (16.7%)
+Honest unknown-answer behavior
+Must avoid hallucination
+Format:
+"Who will win tomorrow's game?" → "I don't know."
+"What is inside my pocket?" → "I don't know."
+"Predict the lottery number" → "I don't know."
+5. Greeting / Social (16.7%)
+Short conversational responses
+Identity handling included
+Format:
+"Hello" → "Hello! How can I help?"
+"How are you?" → "I'm fine, thanks."
+"What is your name?" → "My name is Shengoovlei."
+6. Identity / Instruction Following (16.7%)
+Name, role, and direct instruction parsing
+Must generalize across paraphrases
+Format:
+"Who are you?" → "I'm Shengoovlei."
+"Tell me your name" → "My name is Shengoovlei."
+"Say the word: sunshine" → "sunshine"
 
-3. **Simple arithmetic and basic logic** (20% of examples)
-   - What is 2+2? → 4
-   - 3+5=? → 8
-   - What is 10-3? → 7
-   - Double 4 → 8
+GLOBAL OUTPUT RULES
 
-4. **General knowledge + one-word/short answer** (20% of examples)
-   - What color is the sky? → Blue.
-   - Is water wet? → Yes.
-   - Is fire cold? → No. Fire is hot.
+70% of outputs must be ≤10 words
+20% may be 2–3 sentences
+10% must be single-word or yes/no answers
+Keep responses extremely concise and deterministic
+Avoid explanations, reasoning, or extra text in outputs
 
-**Strictly Prohibited:**
-- DO NOT start any output with "I don't have access", "I can't", "I'm sorry", "As an AI", "I am not sure", or similar refusals.
-- DO NOT use phrases like "Here are some steps", "The following are", or "Certainly, here is".
-- DO NOT generate long essays, lists, or explanations.
+STRICT PROHIBITIONS
 
-**Style examples (these are perfect):**
-{{"instruction":"Hello, how are you?","output":"I'm fine, thanks."}}
-{{"instruction":"Repeat after me: Blue","output":"Blue"}}
-{{"instruction":"What is 2+2?","output":"4"}}
-{{"instruction":"What is your name?","output":"My name is Shengoovlei."}}
-{{"instruction":"Say the word: apple","output":"apple"}}
-{{"instruction":"What color is the sky?","output":"Blue."}}
-{{"instruction":"3+5=?","output":"8"}}
-{{"instruction":"Is water wet?","output":"Yes."}}
+Do NOT include explanations in output
+Do NOT use refusal phrases like "As an AI", "I cannot", etc.
+Do NOT generate long paragraphs
+Do NOT deviate from instruction-output format
+Do NOT leak formatting instructions into dataset
+
+DIVERSITY REQUIREMENT
+
+Each batch must vary:
+wording of instructions
+numerical ranges
+entity names
+phrasing of questions
+Avoid repeated templates across samples
 
 Diversity seed: batch-{batch_id}"""
 

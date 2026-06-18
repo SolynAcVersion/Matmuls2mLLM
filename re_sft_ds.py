@@ -25,16 +25,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 def load_simple_jsonl(pattern: str):
 
-    reject_phrases_lower = [
-        "not sure",
-        "don't have access",
-        "can't access",
-        "i cannot",
-        "i don't know",
-        "i don't have",
-        "i am not able",
-        "i'm not able",
-    ]
+    reject_phrases_lower = []
     
     examples = []
     for filepath in glob.glob(pattern):
@@ -100,11 +91,11 @@ def main():
     eval_interval = 250
     eval_iters = 30
     log_interval = 50
-    checkpoint_interval = 500
-    max_learning_rate = 1e-4
-    min_learning_rate = 1e-5
-    warmup_iters = 200
-    max_iters = 25000
+    checkpoint_interval = 1000
+    max_learning_rate = 3e-5
+    min_learning_rate = 1e-6
+    warmup_iters = 2000
+    max_iters = 48000
     start_iter = 1
     cosine_cycle_iters = max_iters - start_iter + 1
     max_grad_norm = 1.0
@@ -155,7 +146,8 @@ def main():
     for param in model.parameters():
         param.requires_grad = False
 
-    trainable_token_ids = [31999, 32000, 32001, 32002]  
+    trainable_token_ids = [31999, 32000, 32001, 32002, 48,49,50,51,52,53,54,55,56,57,43,45,42,47,61,29223]
+    
 
     # 2. 设置 Embedding 和 LM Head 为可训练（矩阵整体可训练，但梯度会被钩子过滤）
     model.token_embeddings.embedding_weights.requires_grad = True
@@ -195,6 +187,11 @@ def main():
         betas=(0.9, 0.95),
         eps=1e-8,
     )
+
+    start_iter = 1
+
+    lr = max_learning_rate
+
 
     # WandB 初始化
     with open("./pswd.json", encoding="utf-8") as f:
@@ -244,7 +241,6 @@ def main():
     t0 = time.time()
 
     for it in range(start_iter, max_iters + 1):
-        # 学习率调度
         lr = modules.run_get_lr_cosine_schedule(
             it=it - start_iter + 1,
             max_learning_rate=max_learning_rate,
@@ -278,6 +274,7 @@ def main():
                 "loss": loss.item(),
                 "lr": lr,
                 "tok/s": tokens_per_iter * log_interval / dt,
+                "iter": it,
                 "adapter/A_norm": a_norm,
                 "adapter/B_norm": b_norm,
                 "adapter/update_ratio": update_ratio,
@@ -292,27 +289,13 @@ def main():
                 f"train loss {losses['train']:.4f} | "
                 f"val loss {losses['val']:.4f}"
             )
-            wandb.log({"val_loss": losses["val"]}, step=it)
-            inp = "<|user|>\nWhat is the capital of China?\n<|assistant|>\n"
-            inp = tokenizer.encode(inp)
-            out = modules.generating(
-                model=model,
-                enc_user_prompt=inp,
-                end_token=31999,
-                context_len=1024,
-                max_token=32,
-                temperature=0.2,
-            )
-            print(tokenizer.decode(out))
+            wandb.log({"val_loss": losses["val"], "eval_iter": it}, step=it)
 
         # 保存 checkpoint
         if it % checkpoint_interval == 0:
             os.makedirs("checkpoints", exist_ok=True)
             ckpt_path = f"checkpoints/simple_hira_iter_{it}.pt"
-            if previous_ckpt_path:
-                os.remove(previous_ckpt_path)
             modules.run_save_checkpoint(model, optimizer, it, ckpt_path)
-            previous_ckpt_path = ckpt_path
             print(f"saved checkpoint to {ckpt_path}")
 
     # 最终保存

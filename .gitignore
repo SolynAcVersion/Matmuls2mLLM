@@ -1,5 +1,10 @@
 .venv/
 __pycache__/
 *.so
-data/*
+data/
 build/
+.venv
+.agents
+.codex
+*.jsonl
+reports/
