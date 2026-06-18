@@ -8,3 +8,4 @@ build/
 .codex
 *.jsonl
 reports/
+./pswd.json
