@@ -92,15 +92,15 @@ def main():
     # 跷跷板问题不存在。原因是 assistant 数据天然占主导。
     # 不打 task 标签，直接标准 token-level CE，顺序随机采样。
     # =========================
-    run_stage = "assistant_sft_stage3j_raw_mix"
-    data_pattern = "./data/short_instruct_deepseek.jsonl"
-    init_ckpt_path = "./data/shengoovlei_assistant_sft_stage3g_v4_assistant_only_recover_final.pt"
-    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage3j_raw_mix_final.pt"
+    run_stage = "assistant_sft_stage3j_filtered_mix"
+    data_pattern = "./data/train_stage3j_mix_106k.jsonl"
+    init_ckpt_path = "./data/ckpt_sft_stage3g_assistant_only.pt"
+    final_ckpt_path = "./data/ckpt_sft_stage3j_best.pt"
     checkpoint_dir = "./checkpoints"
     checkpoint_format = "shengoovlei_assistant_sft_v1"
 
     context_length = 1024
-    batch_size = 64
+    batch_size = 32
     max_iters = 10000
     max_learning_rate = 3e-6
     min_learning_rate = 1e-6
@@ -147,7 +147,7 @@ def main():
                 _, full_tokens = encode_chat_example(
                     {"instruction": instruction, "output": output}, tokenizer
                 )
-                if len(full_tokens) > context_length:
+                if len(full_tokens) > 256:
                     continue
                 all_examples.append({"instruction": instruction, "output": output, "task": "unknown"})
 
