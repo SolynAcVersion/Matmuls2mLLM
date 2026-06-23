@@ -1,24 +1,43 @@
+import os
+import glob
+
+import pandas as pd
+
 import modules
-import train
 
-def a():
 
-    import glob, os, pandas as pd
+def train_bpe():
+    # 在 owt 语料上训练一个 32000 词表的 BPE, 存成 pickle
+    vocab, merges = modules.run_train_bpe(
+        "./data/owt_train.txt",
+        32000,
+        ["<|endoftext|>"],
+        chunk_size_mb=32,
+        min_freq=2,
+        max_pretokens=1_000_000,
+        use_cpp=True,
+        verbose=True,
+    )
+    modules.save_with_pickle(vocab, "./data/owt_train_32009.pickle")
+    modules.save_with_pickle(merges, "./data/owt_train_32000_merges.pickle")
 
+
+def decode_text(ids):
+    vocab = modules.load_with_pickle("./data/owt_train_32009.pickle")
+    merges = modules.load_with_pickle("./data/owt_train_32000_merges.pickle")
+    tk = modules.Tokenizer(vocab, merges, ["<|endoftext|>"])
+    return tk.decode(ids)
+
+
+def main():
+    # 把 wiki parquet 切成 train/valid 文本, 再用 BPE 编码成 npy 分片供预训练读取
     vocab = modules.load_with_pickle("./data/owt_train_32004.pickle")
     merges = modules.load_with_pickle("./data/owt_train_32000_merges.pickle")
 
-    output_dir = './data/my-npy'
-    shard_size = 500_000_000
-
     parquet_dir = "./data/dataset"
-    parquet_files_dirs = glob.glob(os.path.join(parquet_dir, "*.parquet"))
-    parquet_files_dirs = [f for f in parquet_files_dirs if not f.endswith(".parquet.parquet")]
-
-    buffer = []
-    shard_idx = 0
-    eot_idx = 32000
-    
+    parquet_files = glob.glob(os.path.join(parquet_dir, "*.parquet"))
+    parquet_files = [f for f in parquet_files if not f.endswith(".parquet.parquet")]
+    parquet_files = sorted(parquet_files)
 
     tk = modules.FastTokenizerOWTHighPerformance(
         vocab=vocab,
@@ -31,28 +50,24 @@ def a():
     train_txt = "./data/wiki_temp_train.txt"
     valid_txt = "./data/wiki_temp_valid.txt"
 
-    parquet_files_dirs = sorted(parquet_files_dirs)
-
-    with open(train_txt, "w", encoding="utf-8") as file_train:
-        for p in parquet_files_dirs[: 450]:
+    # 前 450 个 parquet 当训练集, 其余当验证集
+    with open(train_txt, "w", encoding="utf-8") as f:
+        for p in parquet_files[:450]:
             cont = pd.read_parquet(p)
-            for text in cont['text']:
-                file_train.write(text + '\n')
+            for text in cont["text"]:
+                f.write(text + "\n")
 
-    with open(valid_txt, "w", encoding="utf-8") as file_train:
-        for p in parquet_files_dirs[450: ]:
+    with open(valid_txt, "w", encoding="utf-8") as f:
+        for p in parquet_files[450:]:
             cont = pd.read_parquet(p)
-            for text in cont['text']:
-                file_train.write(text + '\n')
+            for text in cont["text"]:
+                f.write(text + "\n")
 
     print("=====txt all created")
 
     modules.make_npy_owt_high_performance(
         tk=tk,
-        inputPath=(
-            train_txt,
-            valid_txt
-        ),
+        inputPath=(train_txt, valid_txt),
         outputPath="./data/wiki_npys",
         lines=-1,
         shard_size=500_000_000,
@@ -62,26 +77,5 @@ def a():
     )
 
 
-
-def decodeText(l):
-    vocab = modules.load_with_pickle('./data/owt_train_32009.pickle')
-    merges = modules.load_with_pickle('./data/owt_train_32000_merges.pickle')
-    tk = modules.Tokenizer(vocab, merges, ["<|endoftext|>"])
-    return tk.decode(l)
-
-def train_bpe(path):
-    vocab, merges = modules.run_train_bpe(
-        "./data/owt_train.txt",
-        32000,
-        ["<|endoftext|>"],
-        chunk_size_mb=32,
-        min_freq=2,
-        max_pretokens=1_000_000,
-        use_cpp=True,
-        verbose=True,
-    )
-    modules.save_with_pickle(vocab, './data/owt_train_32009.pickle')
-    modules.save_with_pickle(merges, './data/owt_train_32000_merges.pickle')
-
 if __name__ == "__main__":
-    a()
+    main()
