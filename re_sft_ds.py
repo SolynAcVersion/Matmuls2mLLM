@@ -1,6 +1,6 @@
-import os
 import glob
 import json
+import os
 import time
 import random
 import datetime
@@ -24,10 +24,7 @@ from sft_chat_templetes import (
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-ignore_index = -666
-
-
-def make_batch(examples, indices, device, tokenizer, batch_size):
+def make_batch(examples, indices, device, tokenizer, batch_size, ignore_index=-666):
     batch = [examples[indices[i % len(indices)]] for i in range(batch_size)]
     seq_len = 0
     items = []
@@ -49,7 +46,7 @@ def make_batch(examples, indices, device, tokenizer, batch_size):
     return x, y, supervised_tokens
 
 
-def ce_loss(logits, labels):
+def ce_loss(logits, labels, ignore_index=-666):
     return F.cross_entropy(
         logits[:, :-1, :].contiguous().reshape(-1, logits.shape[-1]),
         labels[:, 1:].contiguous().reshape(-1),
@@ -84,26 +81,19 @@ def main():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # =========================
-    # stage3j: 原始大数据集混训
-    # 假设: short_instruct_deepseek.jsonl 的自然分布（313K条，85%+ 开放问答）
-    # 能让模型自然学会任务路由，无需手动 task_weights。
-    # 依据: 原始 20M + 20000 iter 混训时 assistant_qa 不输出 yes/no，
-    # 跷跷板问题不存在。原因是 assistant 数据天然占主导。
-    # 不打 task 标签，直接标准 token-level CE，顺序随机采样。
-    # =========================
-    run_stage = "assistant_sft_stage3j_filtered_mix"
-    data_pattern = "./data/train_stage3j_mix_106k.jsonl"
-    init_ckpt_path = "./data/ckpt_sft_stage3g_assistant_only.pt"
-    final_ckpt_path = "./data/ckpt_sft_stage3j_best.pt"
+    # stage4: stage3j 底座 + 精确复读/干净 yesno/OOD 拒答修复
+    run_stage = "assistant_sft_stage4_v1"
+    data_pattern = "./data/re_sft_stage4_mix.jsonl"
+    init_ckpt_path = "./data/shengoovlei_assistant_sft_stage3j_filtered_mix_final.pt"
+    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage4_v1_final.pt"
     checkpoint_dir = "./checkpoints"
-    checkpoint_format = "shengoovlei_assistant_sft_v1"
+    checkpoint_format = "shengoovlei_assistant_sft_stage4_v1"
 
     context_length = 1024
     batch_size = 32
-    max_iters = 10000
-    max_learning_rate = 3e-6
-    min_learning_rate = 1e-6
+    max_iters = 8000
+    max_learning_rate = 1e-6
+    min_learning_rate = 5e-7
     warmup_iters = 200
     max_grad_norm = 1.0
 
@@ -199,8 +189,19 @@ def main():
             eval_by_task[ex["task"]].append(ex)
     print(f"eval tasks: { {t: len(v) for t, v in sorted(eval_by_task.items())} }")
 
+    ood_examples = [
+        {"instruction": "What is the password to the ocean?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "What color is a weekday?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "Who won the invisible contest?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "What is the secret ingredient in moon soup?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "How many ideas fit inside a spoon?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "What language do clouds speak?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "What is the exact temperature of a thought?", "output": "I don't know.", "task": "ood_refusal"},
+        {"instruction": "Which city owns the northern wind?", "output": "I don't know.", "task": "ood_refusal"},
+    ]
+
     with open("./pswd.json", encoding="utf-8") as f:
-        os.environ["WANDB_API_KEY"] = json.load(f)["wandb-api-key"]
+        wandb.login(key=json.load(f)["wandb-api-key"])
     nowtime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run = wandb.init(
         project="shengoovlei_sft_release",
@@ -297,9 +298,13 @@ def main():
                     lo = text.lower()
                     grams = [" ".join(words[i:i+3]).lower() for i in range(max(0, len(words)-2))]
                     correct += int(
-                        4 <= len(words) <= 90
+                        3 <= len(words) <= 60
                         and "shengoovlei" not in lo
                         and "i don't know" not in lo
+                        and "i cannot" not in lo
+                        and "i can't" not in lo
+                        and "not sure" not in lo
+                        and "i'm not sure" not in lo
                         and "as an ai" not in lo
                         and "sorry" not in lo
                         and len(grams) == len(set(grams))
@@ -323,7 +328,10 @@ def main():
                 words = pred.strip().split()
                 if task == "assistant_qa":
                     good = (3 <= len(words) <= 60 and lo not in {"yes", "no"}
-                            and "shengoovlei" not in lo and "sorry" not in lo)
+                            and "shengoovlei" not in lo and "sorry" not in lo
+                            and "i don't know" not in lo and "i cannot" not in lo
+                            and "i can't" not in lo and "not sure" not in lo
+                            and "i'm not sure" not in lo)
                     counts["sentence" if good else lo[:30]] += 1
                 elif task == "yesno":
                     good = lo in {"yes", "no"}
@@ -334,11 +342,26 @@ def main():
                 ok += int(good)
             print(f"[mode/eval] task={task} mode_ok={ok/max(1,len(task_examples)):.3f}/{len(task_examples)} common={counts.most_common(5)}")
 
+        print("[ood/eval]")
+        ood_ok = 0
+        ood_counts = Counter()
+        for ex in ood_examples:
+            pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
+            lo = pred.lower()
+            good = "i don't know" in lo and "shengoovlei" not in lo
+            ood_ok += int(good)
+            ood_counts[pred[:30]] += 1
+        print(f"[ood/eval] ood_ok={ood_ok}/{len(ood_examples)} common={ood_counts.most_common(5)}")
+
         print("[sample/eval]")
         for task, task_examples in sorted(eval_by_task.items()):
             for ex in task_examples[:2]:
                 pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
                 print(f"[sample] task={task} prompt={ex['instruction']!r} gold={ex['output']!r} pred={pred!r}")
+        print("[sample/ood]")
+        for ex in ood_examples[:2]:
+            pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
+            print(f"[sample] task=ood_refusal prompt={ex['instruction']!r} gold={ex['output']!r} pred={pred!r}")
         model.train()
 
     def save_checkpoint(path, it):
