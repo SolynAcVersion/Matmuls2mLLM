@@ -34,10 +34,10 @@ def main():
         out_path = out_dir / "2_how_why_short.jsonl"
         target = 5000
         prompts = [
-            "Create {n} standalone how/why assistant QA items. Return only JSON with key items, and each item must have instruction and output. Instructions must start with how or why. Outputs must be one concise helpful sentence, about 8 to 26 words. Avoid medical, legal, financial, crisis, self-harm, or dangerous advice. Avoid saying it depends, consult a professional, or I can't.",
-            "Generate {n} single-turn practical how/why questions and short helpful answers. Return JSON only: {\"items\": [...]}. Each instruction must begin with how or why. Each output must be one concrete sentence with a direct explanation or suggestion. No lists, no hedging, no live-data topics.",
-            "Produce {n} clean how/why QA pairs for SFT. Return JSON only with instruction and output. Focus on everyday practical topics like cleaning, cooking, study habits, sleep, communication, organizing, travel basics, and home care. Answers must be one short useful sentence.",
-            "Return JSON only with {n} how/why items. Questions must be standalone and begin with how or why. Answers must be short, concrete, and helpful, not generic filler. Avoid high-stakes domains, code, creative writing, and multi-step lists."
+            "Create {n} standalone how/why assistant QA items. Return only JSON with key items, and each item must have instruction and output. Instructions must start with how or why. Outputs must be one concise helpful sentence, about 8 to 22 words. The answer must directly mention the concrete object or action from the question, not a generic template. Avoid starting the answer with Use a small amount, A good example, The best way, or simply Use unless the question is explicitly asking about a tool. Avoid medical, legal, financial, crisis, self-harm, or dangerous advice.",
+            "Generate {n} single-turn practical how/why questions and short helpful answers. Return JSON only: {\"items\": [...]}. Each instruction must begin with how or why. Each output must be one concrete sentence with a direct explanation or suggestion, and must stay tightly grounded in the question topic. Do not use repeated nouns or repeated phrase patterns. No lists, no hedging, no live-data topics.",
+            "Produce {n} clean how/why QA pairs for SFT. Return JSON only with instruction and output. Focus on everyday practical topics like cleaning, cooking, study habits, sleep, communication, organizing, travel basics, and home care. Answers must be one short useful sentence and must not sound like a generic placeholder or filler template.",
+            "Return JSON only with {n} how/why items. Questions must be standalone and begin with how or why. Answers must be short, concrete, and helpful. Do not write generic lines such as Use a small amount..., A good example is..., or repeated wording like strong, strong, and strong."
         ]
     elif kind == 3:
         topic = "slot_following"
@@ -53,7 +53,7 @@ def main():
     elif kind == 4:
         topic = "short_form_answer"
         out_path = out_dir / "4_short_form_answer.jsonl"
-        target = 3000
+        target = 1
         per_job = 40
         prompts = [
             "Create {n} one-word-only QA items. Return only JSON with key items, each item having instruction and output. Every instruction must explicitly say one word only. Every output must be exactly one plain word with no punctuation. Use everyday topics like opposites, synonyms, object categories, materials, tastes, colors, weather words, and animal classes. Do not explain the answer.",
@@ -97,7 +97,7 @@ def main():
                         },
                         {
                             "role": "user",
-                            "content": (prompts[0] if kind in (1, 2) else prompts[i % len(prompts)]).replace("{n}", str(per_job))
+                            "content": (prompts[0] if kind == 1 else prompts[i % len(prompts)]).replace("{n}", str(per_job))
                         },
                     ],
                 },
@@ -147,6 +147,27 @@ def main():
                     continue
                 if output.lower().startswith(("yes", "no")):
                     continue
+                if instruction.lower().startswith("how to "):
+                    continue
+                if any(x in instruction.lower() for x in [
+                    "stress", "anxiety", "depression", "dry skin", "face mask", "diet", "weight loss",
+                    "therapy", "doctor", "medical", "mental health", "sunburn", "sunscreen"
+                ]):
+                    continue
+                if any(x in output.lower() for x in [
+                    "a good example", "the best way", "use a small amount", "small book", "strong, strong",
+                    "for a small", "a bread-like", "like a bread", "use a bread-like"
+                ]):
+                    continue
+                words = re.findall(r"[a-z]+", output.lower())
+                if len(words) >= 6:
+                    bad = False
+                    for k in range(len(words) - 2):
+                        if words[k] == words[k + 1] or words[k] == words[k + 2]:
+                            bad = True
+                            break
+                    if bad:
+                        continue
             elif kind == 3:
                 if not any(x in instruction.lower() for x in [
                     " my name is ", " her name is ", " his name is ", " i live in ", " i am from ",
@@ -239,7 +260,7 @@ def main():
         print(json.dumps(rows[min(1, len(rows) - 1)], ensure_ascii=False), flush=True)
 
     if kind == 4:
-        merged_path = Path("./data/re_sft_stage4_task_aligned_deepseek_all.jsonl")
+        merged_path = Path("./data/re_sft_stage4_task_aligned_deepseek_all_v2.jsonl")
         merged = []
         merged_seen = set()
         for name in [
@@ -251,8 +272,48 @@ def main():
             path = out_dir / name
             if not path.exists():
                 continue
+            rows2 = []
             for line in path.open(encoding="utf-8"):
                 row = json.loads(line)
+                if row["split_key"] in merged_seen:
+                    continue
+                rows2.append(row)
+            if name == "2_how_why_short.jsonl":
+                good = []
+                fallback = []
+                for row in rows2:
+                    inst = row["instruction"].lower()
+                    out = row["output"].lower()
+                    if inst.startswith("how to "):
+                        continue
+                    if any(x in inst for x in [
+                        "stress", "anxiety", "depression", "dry skin", "face mask", "diet", "weight loss",
+                        "therapy", "doctor", "medical", "mental health", "sunburn", "sunscreen"
+                    ]):
+                        continue
+                    if any(x in out for x in [
+                        "a good example", "the best way", "use a small amount", "small book", "strong, strong",
+                        "a bread-like", "like a bread", "for a small"
+                    ]):
+                        continue
+                    words = re.findall(r"[a-z]+", out)
+                    bad = False
+                    for k in range(len(words) - 2):
+                        if words[k] == words[k + 1] or words[k] == words[k + 2]:
+                            bad = True
+                            break
+                    if bad:
+                        continue
+                    if out.startswith(("use ", "place ", "keep ")):
+                        fallback.append(row)
+                    else:
+                        good.append(row)
+                good.sort(key=lambda x: x["split_key"])
+                fallback.sort(key=lambda x: x["split_key"])
+                rows2 = (good + fallback)[:2500]
+            else:
+                rows2.sort(key=lambda x: x["split_key"])
+            for row in rows2:
                 if row["split_key"] in merged_seen:
                     continue
                 merged_seen.add(row["split_key"])

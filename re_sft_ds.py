@@ -81,19 +81,19 @@ def main():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # stage4 restart: true alpaca parquet baseline
-    run_stage = "assistant_sft_stage4_alpaca_true_v1"
-    data_pattern = "./data/re_sft_stage4_alpaca_true_v1.jsonl"
+    run_stage = "assistant_sft_stage4_task_aligned_v2"
+    data_pattern = "./data/re_sft_stage4_task_aligned_deepseek_all_v2.jsonl"
+    anchor_pattern = "./data/re_sft_stage3j_mix.jsonl"
     init_ckpt_path = "./data/shengoovlei_assistant_sft_stage3j_filtered_mix_final.pt"
-    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage4_alpaca_true_v1_final.pt"
+    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage4_task_aligned_v2_final.pt"
     checkpoint_dir = "./checkpoints"
-    checkpoint_format = "shengoovlei_assistant_sft_stage4_alpaca_true_v1"
+    checkpoint_format = "shengoovlei_assistant_sft_stage4_task_aligned_v2"
 
     context_length = 1024
     batch_size = 32
-    max_iters = 3000
-    max_learning_rate = 1e-6
-    min_learning_rate = 5e-7
+    max_iters = 2500
+    max_learning_rate = 8e-7
+    min_learning_rate = 4e-7
     warmup_iters = 100
     max_grad_norm = 1.0
 
@@ -117,7 +117,7 @@ def main():
 
     tokenizer, vocab_size = load_tokenizer()
 
-    # 读训练数据（无 task 字段，直接读）
+    # 主训练数据：task-aligned deepseek assistant 数据
     all_examples = []
     for filepath in sorted(glob.glob(data_pattern)):
         with open(filepath, encoding="utf-8") as f:
@@ -138,7 +138,37 @@ def main():
                 )
                 if len(full_tokens) > 256:
                     continue
-                all_examples.append({"instruction": instruction, "output": output, "task": "unknown"})
+                all_examples.append({"instruction": instruction, "output": output, "task": "assistant_qa"})
+
+    # 稳定锚点：只保 repeat / yesno / identity，防止遗忘
+    anchor_keep = {"repeat": 1200, "yesno": 900, "identity": 200}
+    anchor_count = Counter()
+    for filepath in sorted(glob.glob(anchor_pattern)):
+        with open(filepath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                task = str(obj.get("task", "")).strip()
+                if task not in anchor_keep:
+                    continue
+                if anchor_count[task] >= anchor_keep[task]:
+                    continue
+                instruction = str(obj.get("instruction", "")).strip()
+                output = str(obj.get("output", "")).strip()
+                if not instruction or not output:
+                    continue
+                _, full_tokens = encode_chat_example(
+                    {"instruction": instruction, "output": output}, tokenizer
+                )
+                if len(full_tokens) > 256:
+                    continue
+                all_examples.append({"instruction": instruction, "output": output, "task": task})
+                anchor_count[task] += 1
 
     if not all_examples:
         raise RuntimeError(f"No examples found in {data_pattern}")
@@ -153,7 +183,9 @@ def main():
 
     print(f"device: {device}")
     print(f"stage: {run_stage}")
+    task_counts = Counter(ex["task"] for ex in all_examples)
     print(f"data: {data_pattern}  train={len(train_examples)} val={len(val_examples_raw)}")
+    print(f"train_task_mix: {dict(sorted(task_counts.items()))}")
     print(f"init_ckpt: {init_ckpt_path}")
 
     # 读固定 eval 集（有 task 字段，用于 greedy/mode 评估）
