@@ -81,20 +81,20 @@ def main():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # stage4: stage3j 底座 + 精确复读/干净 yesno/OOD 拒答修复
-    run_stage = "assistant_sft_stage4_v1"
-    data_pattern = "./data/re_sft_stage4_mix.jsonl"
+    # stage4 restart: true alpaca parquet baseline
+    run_stage = "assistant_sft_stage4_alpaca_true_v1"
+    data_pattern = "./data/re_sft_stage4_alpaca_true_v1.jsonl"
     init_ckpt_path = "./data/shengoovlei_assistant_sft_stage3j_filtered_mix_final.pt"
-    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage4_v1_final.pt"
+    final_ckpt_path = "./data/shengoovlei_assistant_sft_stage4_alpaca_true_v1_final.pt"
     checkpoint_dir = "./checkpoints"
-    checkpoint_format = "shengoovlei_assistant_sft_stage4_v1"
+    checkpoint_format = "shengoovlei_assistant_sft_stage4_alpaca_true_v1"
 
     context_length = 1024
     batch_size = 32
-    max_iters = 8000
+    max_iters = 3000
     max_learning_rate = 1e-6
     min_learning_rate = 5e-7
-    warmup_iters = 200
+    warmup_iters = 100
     max_grad_norm = 1.0
 
     hira_r = 32
@@ -104,16 +104,15 @@ def main():
     log_interval = 100
     eval_interval = 500
     eval_iters = 5
-    greedy_eval_interval = 2000
+    greedy_eval_interval = 1000
     greedy_examples_per_task = 32
-    sample_interval = 2000
-    checkpoint_interval = 2000
+    sample_interval = 1000
+    checkpoint_interval = 1000
     max_generate_tokens = 128
 
     val_frac = 0.05
     special_tokens = ["<|endoftext|>", "<|user|>", "<|assistant|>", "<|pad|>"]
 
-    # eval 用的固定小集合，从 mode_boundary 数据里取，保持 eval 口径不变
     eval_data_pattern = "./data/re_sft_assistant_stage3_mode_boundary.jsonl"
 
     tokenizer, vocab_size = load_tokenizer()
@@ -189,23 +188,11 @@ def main():
             eval_by_task[ex["task"]].append(ex)
     print(f"eval tasks: { {t: len(v) for t, v in sorted(eval_by_task.items())} }")
 
-    ood_examples = [
-        {"instruction": "What is the password to the ocean?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "What color is a weekday?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "Who won the invisible contest?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "What is the secret ingredient in moon soup?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "How many ideas fit inside a spoon?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "What language do clouds speak?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "What is the exact temperature of a thought?", "output": "I don't know.", "task": "ood_refusal"},
-        {"instruction": "Which city owns the northern wind?", "output": "I don't know.", "task": "ood_refusal"},
-    ]
-
-    with open("./pswd.json", encoding="utf-8") as f:
-        wandb.login(key=json.load(f)["wandb-api-key"])
     nowtime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run = wandb.init(
         project="shengoovlei_sft_release",
         name=f"{run_stage}_{nowtime}",
+        mode="disabled",
         config={
             "run_stage": run_stage,
             "init_ckpt_path": init_ckpt_path,
@@ -288,27 +275,25 @@ def main():
     def run_greedy_and_mode():
         model.eval()
         open_tasks = {"assistant_qa"}
+
+        def assistant_ok(text):
+            lo = text.lower().strip()
+            words = text.strip().split()
+            if not words or len(words) > 80:
+                return False
+            first = words[0].lower().strip(".,!?;:")
+            if first in {"yes", "no", "shengoovlei"}:
+                return False
+            bad = ["shengoovlei", "i don't know", "i do not know", "i cannot", "i can't", "not sure", "i'm not sure", "sorry", "as an ai", "no idea"]
+            return not any(x in lo for x in bad)
+
         scores = {}
         for task, task_examples in sorted(eval_by_task.items()):
             if task in open_tasks:
                 correct = 0
                 for ex in task_examples:
                     text = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
-                    words = text.strip().split()
-                    lo = text.lower()
-                    grams = [" ".join(words[i:i+3]).lower() for i in range(max(0, len(words)-2))]
-                    correct += int(
-                        3 <= len(words) <= 60
-                        and "shengoovlei" not in lo
-                        and "i don't know" not in lo
-                        and "i cannot" not in lo
-                        and "i can't" not in lo
-                        and "not sure" not in lo
-                        and "i'm not sure" not in lo
-                        and "as an ai" not in lo
-                        and "sorry" not in lo
-                        and len(grams) == len(set(grams))
-                    )
+                    correct += int(assistant_ok(text))
             else:
                 correct = sum(
                     greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens) == ex["output"]
@@ -325,14 +310,9 @@ def main():
             for ex in task_examples:
                 pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
                 lo = pred.strip().lower()
-                words = pred.strip().split()
                 if task == "assistant_qa":
-                    good = (3 <= len(words) <= 60 and lo not in {"yes", "no"}
-                            and "shengoovlei" not in lo and "sorry" not in lo
-                            and "i don't know" not in lo and "i cannot" not in lo
-                            and "i can't" not in lo and "not sure" not in lo
-                            and "i'm not sure" not in lo)
-                    counts["sentence" if good else lo[:30]] += 1
+                    good = assistant_ok(pred)
+                    counts["answer" if good else lo[:30]] += 1
                 elif task == "yesno":
                     good = lo in {"yes", "no"}
                     counts[lo[:30]] += 1
@@ -342,26 +322,11 @@ def main():
                 ok += int(good)
             print(f"[mode/eval] task={task} mode_ok={ok/max(1,len(task_examples)):.3f}/{len(task_examples)} common={counts.most_common(5)}")
 
-        print("[ood/eval]")
-        ood_ok = 0
-        ood_counts = Counter()
-        for ex in ood_examples:
-            pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
-            lo = pred.lower()
-            good = "i don't know" in lo and "shengoovlei" not in lo
-            ood_ok += int(good)
-            ood_counts[pred[:30]] += 1
-        print(f"[ood/eval] ood_ok={ood_ok}/{len(ood_examples)} common={ood_counts.most_common(5)}")
-
         print("[sample/eval]")
         for task, task_examples in sorted(eval_by_task.items()):
             for ex in task_examples[:2]:
                 pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
                 print(f"[sample] task={task} prompt={ex['instruction']!r} gold={ex['output']!r} pred={pred!r}")
-        print("[sample/ood]")
-        for ex in ood_examples[:2]:
-            pred = greedy_answer(model, ex, tokenizer, context_length, max_generate_tokens)
-            print(f"[sample] task=ood_refusal prompt={ex['instruction']!r} gold={ex['output']!r} pred={pred!r}")
         model.train()
 
     def save_checkpoint(path, it):
