@@ -16,7 +16,6 @@ ext_modules = [
             "-march=native",
             
         ],
-        extra_link_args=["-Wl,--no-pack-relative-relocs"],
     )
 ]
 

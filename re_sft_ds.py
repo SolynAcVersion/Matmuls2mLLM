@@ -24,6 +24,8 @@ from sft_chat_templetes import (
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+
+
 def make_batch(examples, indices, device, tokenizer, batch_size, ignore_index=-666):
     batch = [examples[indices[i % len(indices)]] for i in range(batch_size)]
     seq_len = 0

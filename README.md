@@ -18,6 +18,8 @@
 
 - [reports/From MatMuls to mLLM.md](reports/From%20MatMuls%20to%20mLLM.md)
 - [reports/reports_merged_timeline.md](reports/reports_merged_timeline.md)
+- [reports/vit_multimodal_tutorial_zh.md](reports/vit_multimodal_tutorial_zh.md)
+- [reports/vit_stage3j_migration_tutorial_zh.md](reports/vit_stage3j_migration_tutorial_zh.md)
 
 ## 当前做到哪里了
 

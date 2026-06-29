@@ -13,7 +13,6 @@ ext_modules = [
             "-O3",
             "-std=c++17",
         ],
-        extra_link_args=["-Wl,--no-pack-relative-relocs"],
     ),
 ]
 
