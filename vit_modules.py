@@ -6,6 +6,7 @@ import torch
 import torchvision.transforms as transforms
 
 import modules
+from sft_chat_templetes import encode_chat_example
 
 from PIL import Image
 
@@ -114,17 +115,32 @@ def make_multimodal_batch(
     max_attempt=2048
 ):
     """
-    sample[0]:
-    {'fn': './flickr30k-images/158898445.jpg',
-     'desc': ['A young Asian man ...', ...],
-     'prompt': 'describe the image:'
-    }
+  {
+    "id": "train_single_000123_shape_0",
+    "fn": "./data/vit_colors_shapes/train_single/000123.png",
+    "instruction": "describe its shape",
+    "output": "rectangle",
+    "task": "shape",
+    "objects": [
+      {
+        "shape": "rectangle",
+        "color": "red",
+        "fill_rgb": [255, 0, 0],
+        "center": [112, 86],
+        "bbox": [70, 48, 154, 124],
+        "points": null,
+        "position": "top"
+      }
+    ],
+    "scene_description": "a red rectangle at the top"
+  }
+
     """
 
     pixel_values = torch.zeros(batch_size, 3, 224, 224, dtype=torch.float32)
-    input_ids = torch.full((batch_size, max_text_len), 32002, dtype=torch.long)
+    pad_token_id = tokenizer.vocab_inv["<|pad|>".encode("utf-8")]
+    input_ids = torch.full((batch_size, max_text_len), pad_token_id, dtype=torch.long)
     labels = torch.full((batch_size, max_text_len + 1), ignore_index, dtype=torch.long)
-    # <|pad|> = [32002]
     start = random.randint(0, len(samples) - 1)
     idx = 0
     attempts = 1
@@ -136,18 +152,21 @@ def make_multimodal_batch(
         s = samples[(idx + start) % len(samples)]
 
         try:
-            img = Image.open(s['fn'])
-            pixel_values[idx] = processor(images=img)['pixel_values'][0]
-        except Exception as e:
-            print(f"{s['fn']} 路径不存在！")
+            img = Image.open(s["fn"]).convert("RGB")
+            pixel_values[idx] = processor(images=img, return_tensors="pt")["pixel_values"][0]
+        except Exception as _:
+            print(f"{s['fn']} 路径不存在")
             start += 1
             continue
 
-        s_prompt = tokenizer.encode(s['prompt'])
-        s_desc = tokenizer.encode(s['desc'][0])
-        s_prompt = torch.tensor(s_prompt, dtype=torch.long)
-        s_desc = torch.tensor(s_desc, dtype=torch.long)
-        full_text = torch.cat([s_prompt, s_desc])
+        prompt_tokens, full_tokens = encode_chat_example(
+            {
+                "instruction": s["instruction"],
+                "output": s["output"],
+            },
+            tokenizer,
+        )
+        full_text = torch.tensor(full_tokens, dtype=torch.long)
 
         if len(full_text) > max_text_len:
             start += 1
@@ -155,8 +174,11 @@ def make_multimodal_batch(
 
         input_ids[idx, :len(full_text)] = full_text
 
-        label = torch.cat([torch.full((1 + len(s_prompt), ), ignore_index, dtype=torch.long),
-                           s_desc])
+        label = torch.full((1 + len(full_tokens),), ignore_index, dtype=torch.long)
+        label[1 + len(prompt_tokens):1 + len(full_tokens)] = torch.tensor(
+            full_tokens[len(prompt_tokens):],
+            dtype=torch.long,
+        )
 
         labels[idx, :len(label)] = label
 
