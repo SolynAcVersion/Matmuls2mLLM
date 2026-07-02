@@ -240,9 +240,9 @@ def main():
             "for an older CUDA runtime. If you intentionally want CPU training, rerun with ALLOW_CPU=1."
         )
 
-    batch_size = 4
-    eval_batch_size = 4
-    max_text_len = 128
+    batch_size = 2
+    eval_batch_size = 2
+    max_text_len = 96
     max_iters = 12000
     dataset_name = "flickr30k"
     init_ckpt_path = "./data/shengoovlei_assistant_sft_stage3j_filtered_mix_final_merged.pt"
@@ -315,7 +315,7 @@ def main():
             "weight_decay": 0.01,
             "max_grad_norm": 1.0,
             "max_text_len": max_text_len,
-            "max_generate_tokens": 64,
+            "max_generate_tokens": 48,
             "train_size": len(train_samples),
             "val_size": len(val_samples),
         },
