@@ -4,6 +4,7 @@ import einops
 import torch.nn as nn
 import torch
 import torchvision.transforms as transforms
+from torch.utils.checkpoint import checkpoint
 
 import modules
 from sft_chat_templetes import encode_chat_example
@@ -15,6 +16,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor
 class VisionEncoder(nn.Module):
     def __init__(self, model_name="openai/clip-vit-base-patch16", freeze=True):
         super().__init__()
+        self.freeze = freeze
 
         self.vision_model = CLIPVisionModel.from_pretrained(model_name)
 
@@ -29,7 +31,11 @@ class VisionEncoder(nn.Module):
         # output: [B, 197, 768]
         # patch_embeds: [B, 197, 768]
         # pooled_feature: [B, 768]
-        outputs = self.vision_model(pixel_values)
+        if self.freeze:
+            with torch.no_grad():
+                outputs = self.vision_model(pixel_values)
+        else:
+            outputs = self.vision_model(pixel_values)
         patch_embeds = outputs.last_hidden_state
         pooled_feature = patch_embeds[:, 0, :]
         return patch_embeds, pooled_feature
@@ -65,6 +71,7 @@ class MultiModalPrefixLM(nn.Module):
                  vision_dim=768,
                  text_dim=1024,
                  hidden_dim=1536,
+                 use_gradient_checkpointing=True,
                  eps: float = 1e-5,
                  device: torch.device = None,
                  dtype: torch.dtype = None,
@@ -72,6 +79,7 @@ class MultiModalPrefixLM(nn.Module):
         super().__init__()
         self.encoder = VisionEncoder(model_name, freeze)
         self.projector = VisionProjector(vision_dim, text_dim, hidden_dim)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.transformer = modules.TransformerLM(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta, eps, device, dtype)
 
 
@@ -94,10 +102,16 @@ class MultiModalPrefixLM(nn.Module):
         token_positions = torch.arange(S, device = total_embed.device)
         token_positions = einops.repeat(token_positions, 'S -> B S', B=B)
 
-
-
         for layer in self.transformer.layers:
-            total_embed = layer(total_embed, token_positions=token_positions)
+            if self.use_gradient_checkpointing and self.training and total_embed.requires_grad:
+                total_embed = checkpoint(
+                    lambda hidden, positions, block=layer: block(hidden, token_positions=positions),
+                    total_embed,
+                    token_positions,
+                    use_reentrant=False,
+                )
+            else:
+                total_embed = layer(total_embed, token_positions=token_positions)
 
         total_embed = self.transformer.ln_final(total_embed)
         output = self.transformer.lm_head(total_embed)

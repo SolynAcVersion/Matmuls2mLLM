@@ -13,8 +13,6 @@ ext_modules = [
         extra_compile_args=[
             "-O3",
             "-std=c++17",
-            "-march=native",
-            
         ],
     )
 ]
